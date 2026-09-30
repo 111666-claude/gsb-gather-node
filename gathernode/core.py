@@ -1,7 +1,7 @@
 """采集点：按时间刷新、每玩家采集次数上限、请求幂等。
 
-缺陷：刷新按调用次数而不是时间、每玩家上限不生效、重复请求重复生效、
-查询全扫节点、刷新之后次数没回满。
+刷新在节点被访问（采集或查询）时按当前时刻懒结算，单次操作 O(1)，
+与节点数、refresh 调用次数都无关。
 """
 
 
@@ -17,33 +17,55 @@ class World:
         self.per_player_max = per_player_max
         self.node_uses = node_uses
         self.nodes = {}
-        self.player_uses = {}
-        self.handled = {}
+        self.handled = set()
         self.scanned = 0
 
     def register(self, node_id, ready_at=0):
-        self.nodes[node_id] = {"uses": self.node_uses, "ready_at": ready_at}
+        self.nodes[node_id] = {
+            "uses": self.node_uses,
+            "ready_at": ready_at,
+            "players": {},
+        }
+
+    def _settle(self, state, now_ms):
+        """按查询时刻懒结算：跨过整周期就回满次数并清空本周期玩家计数。"""
+        delta = now_ms - state["ready_at"]
+        if delta >= self.refresh_ms:
+            periods = delta // self.refresh_ms
+            state["ready_at"] += periods * self.refresh_ms
+            state["uses"] = self.node_uses
+            state["players"].clear()
 
     def refresh(self, now_ms):
-        """刷新采集点。缺陷：每调用一次就给所有节点加一次使用次数。"""
-        for state in self.nodes.values():
-            state["uses"] += 1
-            self.scanned += 1
+        """刷新按查询时刻懒结算，显式调用不产生任何代价。"""
+        return None
 
     def harvest(self, request_id, player, node_id, now_ms):
-        """采集一次。缺陷：不看节点剩余次数、不看每玩家上限、也不记 request_id。"""
+        """采集一次，成功返回 True；任何上限拦截或重复请求返回 False 且不扣次数。"""
         state = self.nodes.get(node_id)
         if state is None:
             raise GatherError("没有这个采集点：%s" % node_id)
+        if request_id in self.handled:
+            return False
+        self._settle(state, now_ms)
+        self.scanned += 1
+        if state["players"].get(player, 0) >= self.per_player_max:
+            return False
+        if state["uses"] <= 0:
+            return False
         state["uses"] -= 1
-        key = (player, node_id)
-        self.player_uses[key] = self.player_uses.get(key, 0) + 1
+        state["players"][player] = state["players"].get(player, 0) + 1
+        self.handled.add(request_id)
         return True
 
     def uses_left(self, node_id, now_ms):
-        """节点剩余次数。缺陷：每次全扫节点表。"""
-        self.scanned += len(self.nodes)
-        return self.nodes.get(node_id, {}).get("uses", 0)
+        """节点剩余次数，只访问该节点一条记录。"""
+        state = self.nodes.get(node_id)
+        if state is None:
+            return 0
+        self._settle(state, now_ms)
+        self.scanned += 1
+        return state["uses"]
 
     def scanned_count(self):
         return self.scanned
